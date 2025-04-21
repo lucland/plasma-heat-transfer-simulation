@@ -15,7 +15,7 @@ dependencies:
   fl_chart: ^0.65.0
   flutter_gl: ^0.0.21
   path_provider: ^2.1.1
-  file_picker: ^6.1.1
+  file_picker: ^10.1.2
   json_annotation: ^4.8.1
   ffi: ^2.1.0
   path: ^1.8.3
