@@ -16,6 +16,10 @@ O Simulador de Fornalha de Plasma é uma aplicação desktop multiplataforma pro
 - **Validação de Modelos**: Comparação com dados experimentais ou analíticos
 - **Métricas e Exportação**: Análise quantitativa e exportação de resultados
 
+## Status de Desenvolvimento
+
+**Nota:** O núcleo de simulação está atualmente passando por uma refatoração significativa para melhorar a precisão da modelagem de mudança de fase. Foi implementado o **Método da Entalpia**, substituindo a abordagem anterior. Atualmente, a equação da entalpia é resolvida usando um método **Euler Explícito**, que pode exigir passos de tempo pequenos para garantir a estabilidade. A implementação de um solver implícito mais robusto (como Crank-Nicolson com tratamento de não-linearidade) é um próximo passo planejado. Consulte `docs/phase_change_modeling.md` e `docs/solver_methods.md` para mais detalhes.
+
 ## Requisitos do Sistema
 
 ### macOS
@@ -46,11 +50,13 @@ O Simulador de Fornalha de Plasma é uma aplicação desktop multiplataforma pro
 
 A documentação completa está disponível na pasta `docs/`:
 
-- **Manual do Usuário**: Guia abrangente para instalação e uso do software
-- **Guia de Referência**: Informações detalhadas sobre parâmetros, fórmulas e APIs
-- **Tutorial**: Passo a passo para iniciantes realizarem sua primeira simulação
-- **Documentação Técnica**: Detalhamento da arquitetura e implementação
-- **Guia de Compilação**: Instruções para compilar e empacotar o software
+- **Manual do Usuário (`user_manual.md`)**: Guia abrangente para instalação e uso do software.
+- **Guia de Referência (`reference_guide.md`)**: Informações detalhadas sobre parâmetros, fórmulas e APIs.
+- **Tutorial (`tutorial.md`)**: Passo a passo para iniciantes realizarem sua primeira simulação.
+- **Documentação Técnica (`technical_documentation.md`)**: Detalhamento da arquitetura e implementação.
+- **Métodos do Solver (`solver_methods.md`)**: Descrição dos métodos numéricos usados na simulação de calor.
+- **Modelagem de Mudança de Fase (`phase_change_modeling.md`)**: Discussão sobre as abordagens para simular fusão e vaporização.
+- **Guia de Compilação (`build_guide.md`)**: Instruções para compilar e empacotar o software.
 
 ## Desenvolvimento
 
@@ -82,6 +88,8 @@ plasma_furnace_simulator/
 │   ├── user_manual.md
 │   ├── reference_guide.md
 │   ├── tutorial.md
+│   ├── solver_methods.md
+│   ├── phase_change_modeling.md
 │   └── build_guide.md
 │
 └── scripts/                  # Scripts de empacotamento
@@ -101,5 +109,5 @@ Este software é distribuído sob a licença MIT. Veja o arquivo LICENSE para ma
 ## Contato
 
 Para suporte técnico ou dúvidas, entre em contato através de:
-- Email: support@plasmafurnacesimulator.com
-- Fórum: www.plasmafurnacesimulator.com/forum
+- Email: lucas.vsc@gmail.com
+- LinkedIn: http://linkedin.com/in/lucasvalentedev
