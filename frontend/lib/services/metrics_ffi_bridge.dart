@@ -2,16 +2,39 @@ import 'dart:convert';
 import 'dart:ffi';
 import 'package:ffi/ffi.dart';
 import '../models/metrics.dart';
+import 'ffi_bridge.dart'; // Import base bridge
+import 'formula_ffi_bridge.dart'; // Import for helpers (temporary)
+
+// --- FFI Function Typedefs for Metrics/Export (JSON based) ---
+
+typedef CalculateMetricsJsonNative = Pointer<Utf8> Function();
+typedef CalculateMetricsJsonDart = Pointer<Utf8> Function();
+
+typedef ExportResultsJsonNative = Int32 Function(Pointer<Utf8>);
+typedef ExportResultsJsonDart = int Function(Pointer<Utf8>);
+
+typedef GenerateReportJsonNative = Int32 Function(Pointer<Utf8>);
+typedef GenerateReportJsonDart = int Function(Pointer<Utf8>);
 
 // Extensão da ponte FFI para suportar métricas e exportação
 extension MetricsFFIBridge on FFIBridge {
+  // REMOVED: Note about using helpers from FormulaFFIBridgeExtension
+  // The helpers are now public on FFIBridge itself.
+
   // Calcula métricas a partir dos resultados da simulação
   Future<SimulationMetrics> calculateMetrics() async {
     try {
-      final jsonString = _callNativeFunction('calculate_metrics', []);
+      // Load func directly
+      final func = dylib
+          .lookup<NativeFunction<CalculateMetricsJsonNative>>(
+              'calculate_metrics_json')
+          .asFunction<CalculateMetricsJsonDart>();
+      final jsonString =
+          callJsonReturningFunction(func); // Use public helper from FFIBridge
       final Map<String, dynamic> jsonMap = json.decode(jsonString);
       return SimulationMetrics.fromJson(jsonMap);
     } catch (e) {
+      print("Error in calculateMetrics: $e");
       throw Exception('Erro ao calcular métricas: $e');
     }
   }
@@ -19,9 +42,16 @@ extension MetricsFFIBridge on FFIBridge {
   // Exporta resultados da simulação
   Future<void> exportResults(ExportOptions options) async {
     try {
+      // Load func directly
+      final func = dylib
+          .lookup<NativeFunction<ExportResultsJsonNative>>(
+              'export_results_json')
+          .asFunction<ExportResultsJsonDart>();
       final optionsJson = json.encode(options.toJson());
-      _callNativeFunction('export_results', [optionsJson]);
+      callVoidReturningFunction1Arg(
+          func, optionsJson); // Use public helper from FFIBridge
     } catch (e) {
+      print("Error in exportResults: $e");
       throw Exception('Erro ao exportar resultados: $e');
     }
   }
@@ -29,66 +59,18 @@ extension MetricsFFIBridge on FFIBridge {
   // Gera um relatório com os resultados da simulação
   Future<void> generateReport(String outputPath) async {
     try {
-      _callNativeFunction('generate_report', [outputPath]);
+      // Load func directly
+      final func = dylib
+          .lookup<NativeFunction<GenerateReportJsonNative>>(
+              'generate_report_json')
+          .asFunction<GenerateReportJsonDart>();
+      callVoidReturningFunction1Arg(
+          func, outputPath); // Use public helper from FFIBridge
     } catch (e) {
+      print("Error in generateReport: $e");
       throw Exception('Erro ao gerar relatório: $e');
     }
   }
 
-  // Método auxiliar para chamar funções nativas
-  String _callNativeFunction(String functionName, List<String> args) {
-    // Implementação simplificada - em um ambiente real, isso chamaria
-    // as funções FFI reais definidas no backend Rust
-    
-    // Simulação para desenvolvimento
-    if (functionName == 'calculate_metrics') {
-      // Retornar dados de métricas simulados
-      return '''
-      {
-        "min_temperature": 25.0,
-        "max_temperature": 500.0,
-        "avg_temperature": 250.0,
-        "std_temperature": 75.0,
-        "max_gradient": 100.0,
-        "max_heat_flux": 5000.0,
-        "total_energy": 1000000.0,
-        "avg_heating_rate": 10.0,
-        "region_metrics": [
-          {
-            "name": "Centro",
-            "min_temperature": 400.0,
-            "max_temperature": 500.0,
-            "avg_temperature": 450.0,
-            "volume": 0.01,
-            "energy": 500000.0
-          },
-          {
-            "name": "Meio",
-            "min_temperature": 200.0,
-            "max_temperature": 400.0,
-            "avg_temperature": 300.0,
-            "volume": 0.02,
-            "energy": 350000.0
-          },
-          {
-            "name": "Periferia",
-            "min_temperature": 25.0,
-            "max_temperature": 200.0,
-            "avg_temperature": 100.0,
-            "volume": 0.03,
-            "energy": 150000.0
-          }
-        ],
-        "temporal_metrics": {
-          "time_to_half_max": 5.0,
-          "time_to_90_percent_max": 15.0,
-          "max_heating_rate": 20.0,
-          "stabilization_time": 30.0
-        }
-      }
-      ''';
-    }
-    
-    return '';
-  }
+  // REMOVED: _callNativeFunction simulation
 }

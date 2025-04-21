@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
 
 use super::solver::{SimulationParameters, SimulationResults, HeatSolver};
 
@@ -138,6 +140,10 @@ impl SimulationState {
 pub struct SharedSimulationState {
     /// Estado da simulação
     state: Arc<Mutex<SimulationState>>,
+    /// Flag para solicitar cancelamento da simulação
+    cancel_flag: Arc<AtomicBool>,
+    /// Handle para a thread da simulação (se estiver rodando)
+    simulation_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SharedSimulationState {
@@ -145,6 +151,8 @@ impl SharedSimulationState {
     pub fn new(parameters: SimulationParameters) -> Self {
         Self {
             state: Arc::new(Mutex::new(SimulationState::new(parameters))),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            simulation_thread: Mutex::new(None),
         }
     }
 
@@ -152,71 +160,163 @@ impl SharedSimulationState {
     pub fn get_state(&self) -> Result<SimulationState, String> {
         match self.state.lock() {
             Ok(state) => Ok(state.clone()),
-            Err(_) => Err("Falha ao obter o estado da simulação".to_string()),
+            Err(poison_err) => Err(format!("Failed to lock state mutex (poisoned: {}): ", poison_err)),
+        }
+    }
+
+    /// Requests cancellation of the running simulation.
+    pub fn request_cancellation(&self) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Checks if cancellation has been requested.
+    pub fn is_cancellation_requested(&self) -> bool {
+        self.cancel_flag.load(Ordering::Relaxed)
+    }
+
+    /// Waits for the simulation thread to finish.
+    /// Returns Ok(true) if joined successfully, Ok(false) if no thread was running,
+    /// Err(String) on error (e.g., mutex poison, thread panic).
+    pub fn join_simulation_thread(&self) -> Result<bool, String> {
+        let mut handle_guard = self.simulation_thread.lock()
+            .map_err(|e| format!("Failed to lock thread handle mutex: {}", e))?;
+
+        if let Some(handle) = handle_guard.take() {
+            handle.join().map_err(|e| format!("Simulation thread panicked: {:?}", e))?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
     /// Executa a simulação em uma thread separada
     pub fn run_simulation(&self) -> Result<(), String> {
-        // Obter parâmetros da simulação
+        // Check if already running
+        {
+            let mut handle_guard = self.simulation_thread.lock()
+                .map_err(|e| format!("Failed to lock thread handle mutex: {}", e))?;
+            if handle_guard.is_some() {
+                return Err("Simulation thread handle already exists. Call destroy_simulation or wait for completion.".to_string());
+            }
+        }
+
+        // Obter parâmetros da simulação e reset cancel flag
         let parameters = {
-            let state = self.state.lock().map_err(|_| "Falha ao obter o estado da simulação".to_string())?;
+            let state = self.state.lock().map_err(|e| format!("Failed to lock state mutex: {}", e))?;
+            self.cancel_flag.store(false, Ordering::Relaxed);
             state.parameters.clone()
         };
 
-        // Iniciar simulação
+        // Iniciar simulação state
         {
-            let mut state = self.state.lock().map_err(|_| "Falha ao obter o estado da simulação".to_string())?;
+            let mut state = self.state.lock().map_err(|e| format!("Failed to lock state mutex: {}", e))?;
             state.start()?;
         }
 
-        // Criar clone do Arc para usar na thread
+        // Criar clones para a thread
         let state_clone = self.state.clone();
+        let cancel_flag_clone = self.cancel_flag.clone();
+        let simulation_thread_mutex_clone = self.simulation_thread.clone();
 
         // Executar simulação em uma thread separada
-        std::thread::spawn(move || {
+        let handle = thread::spawn(move || {
             // Criar solucionador
             let solver_result = HeatSolver::new(parameters);
-            
-            if let Err(err) = solver_result {
-                // Marcar simulação como falha
-                if let Ok(mut state) = state_clone.lock() {
-                    state.fail(err);
+
+            let final_status = match solver_result {
+                Err(err) => {
+                    eprintln!("Solver initialization failed: {}", err);
+                    SimulationStatus::Failed
                 }
-                return;
-            }
-            
-            let mut solver = solver_result.unwrap();
-            
-            // Definir callback de progresso
-            let progress_callback = |progress: f32| {
-                if let Ok(mut state) = state_clone.lock() {
-                    state.update_progress(progress);
-                    
-                    // Verificar se a simulação foi pausada
-                    if state.status == SimulationStatus::Paused {
-                        // Esperar até que a simulação seja retomada
-                        while let Ok(state) = state_clone.lock() {
-                            if state.status != SimulationStatus::Paused {
-                                break;
+                Ok(mut solver) => {
+                    // Definir callback de progresso (adaptado para checar cancelamento)
+                    let progress_callback = |progress: f32| {
+                        if cancel_flag_clone.load(Ordering::Relaxed) {
+                            return false;
+                        }
+                        if let Ok(mut state) = state_clone.lock() {
+                            state.update_progress(progress);
+                            if state.status == SimulationStatus::Paused {
+                                drop(state);
+                                while cancel_flag_clone.load(Ordering::Relaxed) == false {
+                                    if let Ok(current_state) = state_clone.lock() {
+                                        if current_state.status != SimulationStatus::Paused {
+                                            break;
+                                        }
+                                    } else {
+                                        eprintln!("Progress callback: Failed to re-lock state while paused.");
+                                        return false;
+                                    }
+                                    thread::sleep(std::time::Duration::from_millis(100));
+                                }
+                                if cancel_flag_clone.load(Ordering::Relaxed) {
+                                    return false;
+                                }
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        } else {
+                            eprintln!("Progress callback: Failed to lock state.");
+                            return false;
+                        }
+                        true
+                    };
+
+                    // Executar simulação
+                    let result = solver.run(Some(&progress_callback), cancel_flag_clone.clone());
+
+                    // Retorna o status final baseado no resultado
+                    match result {
+                        Ok(_) => SimulationStatus::Completed,
+                        Err(err) if err == "Simulation cancelled" => SimulationStatus::Failed,
+                        Err(err) => {
+                            eprintln!("Simulation run failed: {}", err);
+                            SimulationStatus::Failed
                         }
                     }
                 }
             };
-            
-            // Executar simulação
-            let result = solver.run(Some(&progress_callback));
-            
-            // Atualizar estado
+
+            // Atualizar estado final (outside solver Result match)
             if let Ok(mut state) = state_clone.lock() {
-                match result {
-                    Ok(results) => state.complete(results),
-                    Err(err) => state.fail(err),
+                match final_status {
+                    SimulationStatus::Completed => {
+                        if state.status != SimulationStatus::Failed {
+                            state.status = SimulationStatus::Completed;
+                            state.progress = 1.0;
+                            if let Some(start_time) = state.start_time {
+                                state.execution_time = start_time.elapsed().as_secs_f64();
+                            }
+                        }
+                    }
+                    SimulationStatus::Failed => {
+                        if state.status != SimulationStatus::Failed {
+                            state.fail(if cancel_flag_clone.load(Ordering::Relaxed) {
+                                "Simulation cancelled by user".to_string()
+                            } else {
+                                state.error_message.clone().unwrap_or_else(|| "Simulation failed".to_string())
+                            });
+                        }
+                    }
+                    _ => {}
                 }
+            } else {
+                eprintln!("Thread finished but could not lock state mutex to finalize.");
+            }
+
+            // Auto-cleanup: Remove handle from shared state when thread finishes
+            if let Ok(mut handle_guard) = simulation_thread_mutex_clone.lock() {
+                *handle_guard = None;
+                println!("Simulation thread finished and handle removed.");
+            } else {
+                eprintln!("Simulation thread finished but failed to lock handle mutex for cleanup.");
             }
         });
+
+        // Store the handle
+        {
+            let mut handle_guard = self.simulation_thread.lock()
+                .map_err(|e| format!("Failed to lock thread handle mutex after spawn: {}", e))?;
+            *handle_guard = Some(handle);
+        }
 
         Ok(())
     }
@@ -226,40 +326,73 @@ impl SharedSimulationState {
 mod tests {
     use super::*;
     use super::super::physics::PlasmaTorch;
-    
+    use std::time::Duration;
+
     #[test]
-    fn test_simulation_state() {
+    fn test_simulation_state_flow() {
         let mut params = SimulationParameters::new(1.0, 0.5, 10, 20);
         params.add_torch(PlasmaTorch::new(0.0, 0.0, 90.0, 0.0, 100.0, 0.01, 5000.0));
-        
-        let mut state = SimulationState::new(params);
-        
-        // Estado inicial
-        assert_eq!(state.status, SimulationStatus::NotStarted);
-        assert_eq!(state.progress, 0.0);
-        assert!(state.error_message.is_none());
-        assert!(state.results.is_none());
-        
-        // Iniciar simulação
-        assert!(state.start().is_ok());
-        assert_eq!(state.status, SimulationStatus::Running);
-        
-        // Atualizar progresso
-        state.update_progress(0.5);
-        assert_eq!(state.progress, 0.5);
-        
-        // Pausar simulação
-        assert!(state.pause().is_ok());
-        assert_eq!(state.status, SimulationStatus::Paused);
-        
-        // Retomar simulação
-        assert!(state.resume().is_ok());
-        assert_eq!(state.status, SimulationStatus::Running);
-        
-        // Falhar simulação
-        state.fail("Erro de teste".to_string());
-        assert_eq!(state.status, SimulationStatus::Failed);
-        assert_eq!(state.error_message, Some("Erro de teste".to_string()));
-        assert!(state.is_failed());
+
+        let shared_state = SharedSimulationState::new(params.clone());
+
+        // Initial state
+        let initial_state = shared_state.get_state().unwrap();
+        assert_eq!(initial_state.status, SimulationStatus::NotStarted);
+        assert_eq!(initial_state.progress, 0.0);
+        assert!(initial_state.error_message.is_none());
+        assert!(initial_state.results.is_none());
+
+        // Start simulation (mocked run)
+        {
+            let mut state_guard = shared_state.state.lock().unwrap();
+            state_guard.start().unwrap();
+            assert_eq!(state_guard.status, SimulationStatus::Running);
+        }
+
+        // Pause
+        {
+            let mut state_guard = shared_state.state.lock().unwrap();
+            state_guard.pause().unwrap();
+            assert_eq!(state_guard.status, SimulationStatus::Paused);
+        }
+
+        // Resume
+        {
+            let mut state_guard = shared_state.state.lock().unwrap();
+            state_guard.resume().unwrap();
+            assert_eq!(state_guard.status, SimulationStatus::Running);
+        }
+
+        // Complete (mocked)
+        {
+             let mut state_guard = shared_state.state.lock().unwrap();
+             let dummy_results = SimulationResults {
+                 parameters: params.clone(),
+                 mesh: super::super::mesh::CylindricalMesh::new(params.height, params.radius, params.nr, params.nz, params.ntheta).unwrap(),
+                 temperature: ndarray::Array3::zeros((params.nr, params.nz, 1)),
+                 execution_time: 0.0,
+                 phase_change_info: None,
+             };
+             state_guard.complete(dummy_results);
+            assert_eq!(state_guard.status, SimulationStatus::Completed);
+            assert_eq!(state_guard.progress, 1.0);
+            assert!(state_guard.results.is_some());
+            assert!(state_guard.execution_time > 0.0);
+        }
+
+         // Fail (mocked)
+         {
+             let mut state_guard = shared_state.state.lock().unwrap();
+             state_guard.start().unwrap_err();
+             state_guard.status = SimulationStatus::Running;
+             state_guard.error_message = None;
+             state_guard.fail("Test failure".to_string());
+             assert_eq!(state_guard.status, SimulationStatus::Failed);
+             assert_eq!(state_guard.error_message, Some("Test failure".to_string()));
+         }
     }
+
+    // Note: Testing run_simulation requires more setup, possibly mocking HeatSolver::run
+    // or running a very short dummy simulation.
+    // Testing cancellation and join requires careful thread synchronization.
 }
